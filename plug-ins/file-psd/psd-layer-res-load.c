@@ -218,23 +218,25 @@ static gint     load_resource_cinf    (const PSDlayerres     *res_a,
                                        GInputStream          *input,
                                        GError               **error);
 
-static gint     parse_text_info       (PSDlayer              *lyr_a,
-                                       guint32                len,
+static gint     parse_text_info       (guint32                len,
                                        gchar                 *buf,
                                        GError               **error);
 
-static gint     load_descriptor       (const PSDlayerres     *res_a,
-                                       PSDlayer              *lyr_a,
+static gint     parse_descriptor      (GInputStream          *input,
+                                       gboolean               ibm_pc_format,
+                                       JsonNode             **root_node,
+                                       GError               **error);
+
+static gint     load_descriptor       (GInputStream          *input,
+                                       gboolean               ibm_pc_format,
                                        JsonNode             **base_node,
-                                       GInputStream          *input,
                                        GError               **error);
 
 static gchar  * load_key              (GInputStream          *input,
                                        GError               **error);
 
-static gint     load_type             (const PSDlayerres     *res_a,
-                                       PSDlayer              *lyr_a,
-                                       GInputStream          *input,
+static gint     load_type             (GInputStream          *input,
+                                       gboolean               ibm_pc_format,
                                        const gchar           *class_id,
                                        const gchar           *key,
                                        const gchar           *type,
@@ -582,7 +584,7 @@ load_resource_lpla (const PSDlayerres  *res_a,
   /* Load placed layer */
   static gboolean   msg_flag = FALSE;
   gchar             type[4];
-  guint32           version;
+  guint32           version  = 0;
   gchar            *uniqueID = NULL;
 
   IFDBG(2) g_debug ("Process layer resource block %.4s: Placed layer", res_a->key);
@@ -593,21 +595,21 @@ load_resource_lpla (const PSDlayerres  *res_a,
       psd_set_error (error);
       return -1;
     }
-  //type    = GUINT32_FROM_BE (type);
   version = GUINT32_FROM_BE (version);
   /* Expected
    * for plLd: type: plcL, version: 3,
    * for SoLd: type: soLD, version: 4 (according to docs, also seen: 13), hmmm seems we are reading this wrong, type: 4, version 13 (probably descriptor version)
    * for SoLE, type: soLD, version: 4 or 5. */
-  //IFDBG(3) g_debug ("Placed layer type: (skipped reading), version: %u", version);
-  IFDBG(3) g_debug ("Placed layer type: %.4s, version: %u", type, version);
+
+   IFDBG(3) g_debug ("Placed layer type: %.4s, version: %u", type, version);
 
   if (version == 3)
     {
-      gint32 bread, bwritten;
-      guint32 page_num, total_pages;
-      guint32 anti_alias_policy;
-      guint32 placed_layer_type;
+      gint32  bread, bwritten;
+      guint32 page_num          = 0;
+      guint32 total_pages       = 0;
+      guint32 anti_alias_policy = 0;
+      guint32 placed_layer_type = 0;
 
       /* Read pascal string */
       uniqueID = fread_pascal_string (&bread, &bwritten, 1, input, error);
@@ -636,7 +638,7 @@ load_resource_lpla (const PSDlayerres  *res_a,
     }
   else if (version == 4)
     {
-      guint32 descriptor_version;
+      guint32 descriptor_version = 0;
 
       if (psd_read (input, &descriptor_version, 4, error) < 4)
         {
@@ -647,16 +649,15 @@ load_resource_lpla (const PSDlayerres  *res_a,
       IFDBG(3) g_debug ("Descriptor version: %u",
                         descriptor_version);
 
-      if (load_descriptor (res_a, lyr_a, NULL, input, error) < 0)
+      if (load_descriptor (input, res_a->ibm_pc_format, NULL, error) < 0)
         return -1;
     }
   else if (version == 5)
     {
-      if (load_descriptor (res_a, lyr_a, NULL, input, error) < 0)
+      if (load_descriptor (input, res_a->ibm_pc_format, NULL, error) < 0)
         return -1;
     }
 
-  //lyr_a->drop = TRUE;
   if (! msg_flag && CONVERSION_WARNINGS)
     {
       g_message ("Warning:\n"
@@ -683,7 +684,7 @@ load_resource_llnk (const PSDlayerres     *res_a,
   gchar    file_type[4];
   gchar    file_creator[4];
   guint64  data_len;
-  gboolean file_open_descriptor;
+  gboolean file_open_descriptor = 0;
   gint32   bread, bwritten;
 
   gint     lnk_count = 6;
@@ -691,8 +692,9 @@ load_resource_llnk (const PSDlayerres     *res_a,
 
   IFDBG(2) g_debug ("Process layer resource block %.4s: linked layer data", res_a->key);
 
-  // This really needs a count based on the number of placed layers we found..
-  // For testing we set it here to 6 for our test file...
+  /* FIXME This really needs a count based on the number of placed layers we found..
+   *       For testing we set it here to 6 for our test file...
+   */
 
   for (li = 0; li < lnk_count; li++)
     {
@@ -738,7 +740,7 @@ load_resource_llnk (const PSDlayerres     *res_a,
       data_len = GUINT64_FROM_BE (data_len);
       IFDBG(3) g_debug ("File type: %.4s, creator: %.4s, data length: %" G_GSIZE_FORMAT ", file open: %u",
                         file_type, file_creator, data_len, (guchar) file_open_descriptor);
-      //data_len = (data_len + 3) / 4 * 4;
+
       data_offset = (PSD_TELL(input) + data_len + 3) / 4 * 4;
 
       IFDBG(3) g_debug ("File data offset: %" G_GOFFSET_FORMAT ", real end offset: %" G_GOFFSET_FORMAT,
@@ -774,14 +776,13 @@ load_resource_lfx (const PSDlayerres  *res_a,
                    GError            **error)
 {
   /* Load layer effects */
+  IFDBG(2) g_debug ("Process layer resource block %.4s: Layer effects", res_a->key);
 
   if (memcmp (res_a->key, PSD_LFX_FX2, 4) == 0)
     {
-      guint32    oe_version, desc_version;
-      gint32     res;
-      JsonNode  *root = NULL;
-      JsonArray  *arr = NULL;
-      JsonObject *obj = NULL;
+      guint32    oe_version   = 0;
+      guint32    desc_version = 0;
+      JsonNode  *root         = NULL;
 
       if (psd_read (input, &oe_version, 4, error) < 4 ||
           psd_read (input, &desc_version, 4, error) < 4)
@@ -794,40 +795,23 @@ load_resource_lfx (const PSDlayerres  *res_a,
 
       IFDBG(3) g_debug ("Objects based effects layer info: object effects version: %u, descriptor version: %u", oe_version, desc_version);
 
-      g_printerr ("create root object\n");
-      // TODO: Probably should add some version number to the root in case we
-      //       need to make changes to how we store this info in the future!
-      root = json_node_new (JSON_NODE_OBJECT);
-      if (! root)
+      if (parse_descriptor (input, res_a->ibm_pc_format, &root, error) == 0)
+        {
+          lyr_a->layer_effects = g_new (PSDLayerEffects, 1);
+          lyr_a->layer_effects->effects = root;
+
+          if (root)
+            {
+              /* Print json for debugging... */
+              IFDBG(3) g_printerr ("Layer Effects descriptor for layer %u:\n%s\n",
+                                   lyr_a->id, json_to_string (root, TRUE));
+            }
+        }
+      else
         {
           return -1;
         }
-      obj = json_object_new ();
-      json_node_init_object (root, obj);
-      //obj = json_node_get_object (root);
-/*
-      g_printerr ("create array\n");
-      arr = json_array_new ();
-      if (! arr)
-        {
-          json_node_unref (root);
-          return -1;
-        }
-      g_printerr ("set array as member of root\n");
-      json_object_set_array_member (obj, "lfx2", arr);
-*/
-
-      lyr_a->layer_effects = g_new (PSDLayerEffects, 1);
-      lyr_a->layer_effects->effects = root;
-
-      g_printerr ("load descriptor...\n");
-
-      res = load_descriptor (res_a, lyr_a, &root, input, error);
-      if (res < 0)
-        return res;
     }
-
-  IFDBG(2) g_debug ("Process layer resource block %.4s: Layer effects", res_a->key);
 
   return 0;
 }
@@ -839,11 +823,11 @@ load_resource_ltyp (const PSDlayerres  *res_a,
                     GError            **error)
 {
   /* Load type tool layer */
-  gint16            version        = 0;
-  gint16            text_desc_vers = 0;
-  gint32            desc_version   = 0;
-  gint32            warp_version;
-  gint32            warp_desc_version;
+  gint16            version           = 0;
+  gint16            text_desc_vers    = 0;
+  gint32            desc_version      = 0;
+  gint32            warp_version      = 0;
+  gint32            warp_desc_version = 0;
   /*gint32            read_len;
   gint32            write_len;*/
   gint64            transform[6];
@@ -944,7 +928,7 @@ load_resource_ltyp (const PSDlayerres  *res_a,
                                       res_a->ibm_pc_format, input, error);
       IFDBG(2) g_debug ("Unicode name: %s", classID);
 */
-      res = load_descriptor (res_a, lyr_a, NULL, input, error);
+      res = load_descriptor (input, res_a->ibm_pc_format, NULL, error);
       /*
        * This descriptor seems to have a lot of text formatting etc related
        * data in a format that is not described in the online specs...
@@ -966,7 +950,7 @@ load_resource_ltyp (const PSDlayerres  *res_a,
       IFDBG(2) g_debug ("Warp version: %d, descriptor version: %d",
                         warp_version, warp_desc_version);
 
-      res = load_descriptor (res_a, lyr_a, NULL, input, error);
+      res = load_descriptor (input, res_a->ibm_pc_format, NULL, error);
       if (res < 0)
         return -1;
 /*
@@ -998,7 +982,7 @@ load_resource_ltyp (const PSDlayerres  *res_a,
           val = (gpointer) &tmp;
           d_transform[i] = *val;
           /*d_transform[i] = *(gdouble *) ((gpointer) &tmp);*/
-          g_printerr ("\ti=%d, value %f\n", i, *val);
+          /* g_printerr ("\ti=%d, value %f\n", i, *val); */
           /*d_transform[i] = *(gdouble *) &tmp;*/
         }
       IFDBG(2) g_debug ("Left: %f, Top: %f, Right: %f, Bottom: %f",
@@ -1030,7 +1014,6 @@ static gint load_resource_ltxt (const PSDlayerres  *res_a,
       return -1;
     }
 */
-  //res_len = GUINT32_FROM_BE (res_len);
   res_len = res_a->data_len;
   IFDBG(3) g_debug ("TXT2 resource length: %u", res_len);
 
@@ -1042,7 +1025,7 @@ static gint load_resource_ltxt (const PSDlayerres  *res_a,
       return -1;
     }
   IFDBG(3) g_debug ("Parse text info at offset: %" G_GOFFSET_FORMAT, PSD_TELL(input));
-  parse_text_info (lyr_a, res_len, buf, error);
+  parse_text_info (res_len, buf, error);
   g_free(buf);
   return 0;
 }
@@ -1168,13 +1151,7 @@ load_resource_lsct (const PSDlayerres  *res_a,
 }
 
 /* Adobe uses fixed point ints which consist of 16-bit number and 16-bit fraction */
-/*
-static inline gfloat
-fixed_to_float (gint16 num, gint16 fract)
-{
-  return (gfloat) num + fract / 65535.0f;
-}
-*/
+
 #define FIXED_TO_FLOAT(num,fract) (gfloat) num + fract / 65535.0f
 
 static gint
@@ -1237,45 +1214,6 @@ load_resource_lrfx (const PSDlayerres  *res_a,
             }
           else if (memcmp (effectname, "dsdw", 4) == 0)
             {
-            /*
-              PSDLayerStyleShadow shadow;
-              gint16  bl1, bl2, in1, in2, an1, an2, di1, di2;
-
-              if (memcmp (effectname, "dsdw", 4) == 0)
-                shadow = ls_a->dsdw;
-              else
-                shadow = ls_a->isdw;
-
-              if (psd_read (input, &shadow.size,        4, error) < 4 ||
-                  psd_read (input, &shadow.ver,         4, error) < 4 ||
-                  psd_read (input, &bl1,                2, error) < 2 ||
-                  psd_read (input, &bl2,                2, error) < 2 ||
-                  psd_read (input, &in1,                2, error) < 2 ||
-                  psd_read (input, &in2,                2, error) < 2 ||
-                  psd_read (input, &an1,                2, error) < 2 ||
-                  psd_read (input, &an2,                2, error) < 2 ||
-                  psd_read (input, &di1,                2, error) < 2 ||
-                  psd_read (input, &di2,                2, error) < 2 ||
-//                  psd_read (input, &shadow.blur,        4, error) < 4 ||
-//                  psd_read (input, &shadow.intensity,   4, error) < 4 ||
-//                  psd_read (input, &shadow.angle,       4, error) < 4 ||
-//                  psd_read (input, &shadow.distance,    4, error) < 4 ||
-                  psd_read (input, &shadow.color[0],    2, error) < 2 ||
-                  psd_read (input, &shadow.color[1],    2, error) < 2 ||
-                  psd_read (input, &shadow.color[2],    2, error) < 2 ||
-                  psd_read (input, &shadow.color[3],    2, error) < 2 ||
-                  psd_read (input, &shadow.color[4],    2, error) < 2 ||
-                  psd_read (input, &shadow.blendsig,    4, error) < 4 ||
-                  psd_read (input, &shadow.effect,      4, error) < 4 ||
-                  psd_read (input, &shadow.effecton,    1, error) < 1 ||
-                  psd_read (input, &shadow.anglefx,     1, error) < 1 ||
-                  psd_read (input, &shadow.opacity,     1, error) < 1 ||
-                  psd_read (input, &shadow.natcolor[0], 2, error) < 2 ||
-                  psd_read (input, &shadow.natcolor[1], 2, error) < 2 ||
-                  psd_read (input, &shadow.natcolor[2], 2, error) < 2 ||
-                  psd_read (input, &shadow.natcolor[3], 2, error) < 2 ||
-                  psd_read (input, &shadow.natcolor[4], 2, error) < 2)
-            */
               gchar   bim[4];
               guint16 spacer16;
 
@@ -1301,18 +1239,7 @@ load_resource_lrfx (const PSDlayerres  *res_a,
                   psd_set_error (error);
                   return -1;
                 }
-/*
-              shadow.blur      = FIXED_TO_FLOAT (GUINT16_TO_BE (bl1), GUINT16_TO_BE (bl2));
-              shadow.intensity = FIXED_TO_FLOAT (GUINT16_TO_BE (in1), GUINT16_TO_BE (in2));
-              shadow.angle     = FIXED_TO_FLOAT (GUINT16_TO_BE (an1), GUINT16_TO_BE (an2));
-              shadow.distance  = FIXED_TO_FLOAT (GUINT16_TO_BE (di1), GUINT16_TO_BE (di2));
-              IFDBG(3) g_debug ("%s - size %u, version %u, effect enabled: %u, blur (pixels): %f, intensity (pct): %f, angle (degrees): %f, distance (pixels): %f blendsig: %.4s, effect %.4s", effectname,
-                                GUINT32_TO_BE (shadow.size), GUINT32_TO_BE (shadow.ver),
-                                shadow.effecton,
-                                shadow.blur, shadow.intensity,
-                                shadow.angle, shadow.distance,
-                                shadow.blendsig, &shadow.effect );
-*/
+
               ls_a->dsdw.size      = GUINT32_TO_BE (ls_a->dsdw.size);
               ls_a->dsdw.ver       = GUINT32_TO_BE (ls_a->dsdw.ver);
               ls_a->dsdw.blur      = GUINT16_TO_BE (ls_a->dsdw.blur);
@@ -1411,7 +1338,7 @@ load_resource_lrfx (const PSDlayerres  *res_a,
               IFDBG(3) g_debug ("oglw - size %u, version %u, effect enabled: %u, blendsig: %.4s, effect %.4s",
                                 ls_a->oglw.size, GUINT32_TO_BE (ls_a->oglw.ver),
                                 ls_a->oglw.effecton,
-                                ls_a->oglw.blendsig, &ls_a->oglw.effect );
+                                ls_a->oglw.blendsig, (gchar *) &ls_a->oglw.effect );
               if (ls_a->oglw.size == 42)
                 {
                   if (psd_read (input, &ls_a->oglw.natcolor[0], 2, error) < 2 ||
@@ -1449,7 +1376,7 @@ load_resource_lrfx (const PSDlayerres  *res_a,
               IFDBG(3) g_debug ("iglw - size %u, version %u, effect enabled: %u, blendsig: %.4s, effect %.4s",
                                 ls_a->iglw.size, GUINT32_TO_BE (ls_a->iglw.ver),
                                 ls_a->iglw.effecton,
-                                ls_a->iglw.blendsig, &ls_a->iglw.effect );
+                                ls_a->iglw.blendsig, (gchar *) &ls_a->iglw.effect );
               if (ls_a->iglw.size == 43)
                 {
                   if (psd_read (input, &ls_a->iglw.invert,      1, error) < 1 ||
@@ -1500,8 +1427,8 @@ load_resource_lrfx (const PSDlayerres  *res_a,
               IFDBG(3) g_debug ("bevl - size %u, version %u, effect enabled: %u, highlightsig: %.4s, highlighteffect %.4s, shadowsig: %.4s, shadoweffect %.4s",
                                 ls_a->bevl.size, GUINT32_TO_BE (ls_a->bevl.ver),
                                 ls_a->bevl.enabled,
-                                &ls_a->bevl.highlightsig, &ls_a->bevl.highlighteffect,
-                                &ls_a->bevl.shadowsig, &ls_a->bevl.shadoweffect );
+                                (gchar *) &ls_a->bevl.highlightsig, (gchar *) &ls_a->bevl.highlighteffect,
+                                (gchar *) &ls_a->bevl.shadowsig, (gchar *) &ls_a->bevl.shadoweffect );
               if (ls_a->bevl.size == 78)
                 {
                   if (psd_read (input, &ls_a->bevl.highlightnatcolor[0], 2, error) < 2 ||
@@ -1621,7 +1548,7 @@ load_resource_cinf (const PSDlayerres  *res_a,
                     GInputStream       *input,
                     GError            **error)
 {
-  guint32 version;
+  guint32 version = 0;
 
   IFDBG(2) g_debug ("Process layer resource block %.4s: Compositor Used (cinf)", res_a->key);
 
@@ -1633,14 +1560,13 @@ load_resource_cinf (const PSDlayerres  *res_a,
   version = GUINT32_FROM_BE (version);
   IFDBG(3) g_debug ("Descriptor version (expecting 16): %u", version);
 
-  if (load_descriptor (res_a, lyr_a, NULL, input, error) < 0)
+  if (load_descriptor (input, res_a->ibm_pc_format, NULL, error) < 0)
     return -1;
 
   return 0;
 }
 
-static gint parse_text_info (PSDlayer  *lyr_a,
-                             guint32    len,
+static gint parse_text_info (guint32    len,
                              gchar     *buf,
                              GError   **error)
 {
@@ -1658,7 +1584,7 @@ static gint parse_text_info (PSDlayer  *lyr_a,
   gboolean  reading_binary  = FALSE;
   /*gboolean  read_utf16      = FALSE;*/
 
-  g_printerr ("parsing starts...\n");
+  IFDBG(3) g_debug ("Parsing text info starts...\n");
   while (bufpos < len)
     {
       const gint COMMAND_SIZE = 128; /* No idea what the real Photoshop maximum is. */
@@ -1852,29 +1778,65 @@ static gint parse_text_info (PSDlayer  *lyr_a,
       bufpos++;
     }
   g_free (last_cmd);
-  g_printerr ("parsing done...\n");
+  IFDBG(3) g_debug ("Parsing text info done.\n");
 
   return bufpos;
 }
 
 static gint
-load_descriptor (const PSDlayerres  *res_a,
-                 PSDlayer           *lyr_a,
-                 JsonNode          **base_node,
-                 GInputStream       *input,
-                 GError            **error)
+parse_descriptor (GInputStream  *input,
+                  gboolean       ibm_pc_format,
+                  JsonNode     **root_node,
+                  GError       **error)
 {
-  gchar   *uniqueID       = NULL;
-  gchar   *classID_string = NULL;
-  guint32  num_items;
-  gint32   bread, bwritten;
-  gint     i;
   JsonObject *obj = NULL;
-  JsonArray  *arr = NULL;
+  gint        res = 0;
 
-  //// FOR NOW:
-  JsonNode *local = NULL;
-  JsonNode *root  = NULL;
+  *root_node = json_node_new (JSON_NODE_OBJECT);
+  if (! *root_node)
+    {
+      /* FIXME: What error class would be most suitable here? */
+      g_set_error (error, G_FILE_ERROR, G_FILE_ERROR_FAILED,
+                 _("Error creating json node."));
+      return -1;
+    }
+  obj = json_object_new ();
+  json_node_init_object (*root_node, obj);
+
+  /* FIXME: Should we add a version number to the root in case we
+   *        need to make changes in the future?
+   */
+
+  res = load_descriptor (input, ibm_pc_format, root_node, error);
+  if (res < 0)
+    {
+      json_node_free (*root_node);
+      *root_node = NULL;
+    }
+  else
+    {
+      /* Set immutable for performance when reading the data. */
+      json_node_seal (*root_node);
+    }
+
+  return res;
+}
+
+static gint
+load_descriptor (GInputStream  *input,
+                 gboolean       ibm_pc_format,
+                 JsonNode     **base_node,
+                 GError       **error)
+{
+  gchar      *uniqueID       = NULL;
+  gchar      *classID_string = NULL;
+  guint32     num_items      = 0;
+  gint32      bread, bwritten;
+  gint        i;
+  JsonObject *obj            = NULL;
+  JsonArray  *arr            = NULL;
+  JsonNode   *local          = NULL;
+  JsonNode   *root           = NULL;
 
   if (base_node == NULL || *base_node == NULL)
     {
@@ -1892,7 +1854,7 @@ load_descriptor (const PSDlayerres  *res_a,
 
   IFDBG(3) g_debug ("start load_descriptor - Offset: %" G_GOFFSET_FORMAT, PSD_TELL(input));
   /* Read unicode string */
-  uniqueID = fread_unicode_string (&bread, &bwritten, 1, res_a->ibm_pc_format,
+  uniqueID = fread_unicode_string (&bread, &bwritten, 1, ibm_pc_format,
                                    input, error);
   /* uniqueID seems to always be empty at the root */
   if (! uniqueID)
@@ -1920,11 +1882,9 @@ load_descriptor (const PSDlayerres  *res_a,
   IFDBG(3) g_debug ("Number of items: %u", num_items);
   json_object_set_int_member (obj, "count", num_items);
 
-  g_printerr ("create array\n");
   arr = json_array_new ();
-  // FIXME: Add error checking here and elsewhere!
+  /* FIXME: Add error more checking here and elsewhere! */
 
-  g_printerr ("set array as member of object\n");
   json_object_set_array_member (obj, "descriptor", arr);
 
   for (i = 0; i < num_items; i++)
@@ -1951,17 +1911,15 @@ load_descriptor (const PSDlayerres  *res_a,
       IFDBG(3) g_debug ("Item: %d, key: %s type: %.4s", i, key, type);
 
       node = NULL;
-      res = load_type (res_a, lyr_a, input, classID_string, key, type, &node, error);
+      res = load_type (input, ibm_pc_format, classID_string, key, type, &node, error);
       if (node)
         {
-          g_printerr ("-- Adding descriptor array element\n");
-          //json_array_add_array_element (arr, node);
           json_array_add_element (arr, node);
-          // DEBUG:
-          g_printerr ("Node Json:\n%s\n", json_to_string (node, TRUE));
+          /* For debugging: */
+          /* g_printerr ("Node Json:\n%s\n", json_to_string (node, TRUE)); */
         }
       else
-        g_printerr ("MISSING NODE!\n");
+        g_printerr ("WARNING: Missing node!\n");
       g_free (key);
       if (res < 0)
         return res;
@@ -1970,11 +1928,11 @@ load_descriptor (const PSDlayerres  *res_a,
   if (root)
     {
       /* Print json for debugging... */
-      g_printerr ("Json:\n%s\n", json_to_string (root, TRUE));
+      /* g_printerr ("Json:\n%s\n", json_to_string (root, TRUE)); */
     }
 
   g_free (classID_string);
-  g_printerr ("- return ok from load_descriptor\n");
+
   return 0;
 }
 
@@ -2094,6 +2052,38 @@ add_descriptor_bool (const gchar  *key,
 }
 
 static JsonNode*
+add_descriptor_comp (const gchar  *key,
+                     const gchar  *type,
+                     gint64        value)
+{
+  JsonNode   *local;
+  JsonObject *obj;
+  gchar      *tmp;
+
+  local = json_node_new (JSON_NODE_OBJECT);
+  obj = json_object_new ();
+  json_node_init_object (local, obj);
+
+  json_object_set_string_member (obj, "key",   key);
+
+  tmp = g_strdup_printf ("%.4s", type);
+  json_object_set_string_member (obj, "type",  tmp);
+  g_free (tmp);
+
+  json_object_set_int_member (obj, "value", value);
+
+  return local;
+}
+
+static JsonNode*
+add_descriptor_long (const gchar  *key,
+                     const gchar  *type,
+                     gint32        value)
+{
+  return add_descriptor_comp (key, type, value);
+}
+
+static JsonNode*
 add_descriptor_enum (const gchar  *key,
                      const gchar  *type,
                      const gchar  *name,
@@ -2190,22 +2180,21 @@ add_descriptor_vlls (const gchar  *key,
 }
 
 static gint
-load_type (const PSDlayerres  *res_a,
-           PSDlayer           *lyr_a,
-           GInputStream       *input,
-           const gchar        *class_id,
-           const gchar        *key,
-           const gchar        *type,
-           JsonNode	         **node,
-           GError            **error)
+load_type (GInputStream  *input,
+           gboolean       ibm_pc_format,
+           const gchar   *class_id,
+           const gchar   *key,
+           const gchar   *type,
+           JsonNode	    **node,
+           GError       **error)
 {
-  g_printerr ("Loading type %.4s for key %s\n", type, key);
+  /* g_printerr ("Loading type %.4s for key %s\n", type, key); */
 
   if (memcmp (type, "obj ", 4) == 0)
     {
       /* Reference structure*/
       IFDBG(3) g_debug ("ob 'reference structure'");
-      g_message ("FIXME Type: %s", type);
+      g_message ("FIXME Type: %.4s", type);
     }
   else if (memcmp (type, "Objc", 4) == 0)
     {
@@ -2215,7 +2204,7 @@ load_type (const PSDlayerres  *res_a,
 
       IFDBG(3) g_debug ("Objc Descriptor begin");
       desc_node = add_descriptor_objc (key, type);
-      res = load_descriptor (res_a, lyr_a, &desc_node, input, error);
+      res = load_descriptor (input, ibm_pc_format, &desc_node, error);
       *node = desc_node;
       IFDBG(3) g_debug ("Objc Descriptor end");
       if (res < 0)
@@ -2227,9 +2216,6 @@ load_type (const PSDlayerres  *res_a,
       gint32       list_items = 0;
       gint32       li;
       JsonArray   *arr;
-      //JsonNode    *local;
-      //JsonNode   *arr_node;
-      JsonObject  *obj;
 
       if (psd_read (input, &list_items, 4, error) < 4)
         {
@@ -2239,20 +2225,9 @@ load_type (const PSDlayerres  *res_a,
       list_items = GUINT32_FROM_BE (list_items);
       IFDBG(3) g_debug ("Number of items in list: %i", list_items);
 
-      g_printerr ("create local json object\n");
       *node = add_descriptor_vlls (key, type);
-/*
-      local = json_node_new (JSON_NODE_OBJECT);
-      obj = json_object_new ();
-      json_node_init_object (local, obj);
-      json_object_set_string_member (obj, "key", key);
-      json_object_set_int_member (obj, "count", list_items);
-*/
-      //g_printerr ("create array\n");
       arr = json_array_new ();
-      //g_printerr ("set array member\n");
       json_object_set_array_member (json_node_get_object (*node), "list", arr);
-      g_printerr ("Process items in list\n");
 
       for (li = 0; li < list_items; li++)
         {
@@ -2268,16 +2243,15 @@ load_type (const PSDlayerres  *res_a,
           IFDBG(3) g_debug ("Item: %d, type: %.4s", li, type);
 
           list_node = NULL;
-          res = load_type (res_a, lyr_a, input, class_id, key, type, &list_node, error);
+          res = load_type (input, ibm_pc_format, class_id, key, type, &list_node, error);
           if (res < 0)
             return res;
-          ///////////g_printerr ("Add node array element\n");
+
           if (list_node)
             json_array_add_element (arr, list_node);
           else
             g_printerr ("Failed to add array element!\n");
         }
-      //*node = local;
     }
   else if (memcmp (type, "doub", 4) == 0)
     {
@@ -2300,8 +2274,8 @@ load_type (const PSDlayerres  *res_a,
     {
       /* Unit float */
       gchar    floatkey[4] = "";
-      gdouble  *val;
-      guint64   tmp = 0;
+      gdouble *val;
+      guint64  tmp = 0;
 
       if (psd_read (input, &floatkey, 4, error) < 4)
         {
@@ -2318,16 +2292,15 @@ load_type (const PSDlayerres  *res_a,
 
       IFDBG(3) g_debug ("Float: %.4s, value: %f", floatkey, *val);
       *node = add_descriptor_float (key, type, floatkey, *val);
-
-      //node = json_node_new (JSON_NODE_VALUE);
-      //json_node_set_double (node, *val);
     }
   else if (memcmp (type, "UnFl ", 4) == 0)
     {
       /* Undocumented: Unit Floats */
       gchar   floatkey[4] = "";
-      guint32 count;
+      guint32 count       = 0;
       gint    i;
+
+      g_message ("FIXME Type: %.4s - missing json conversion", type);
 
       if (psd_read (input, &floatkey, 4, error) < 4)
         {
@@ -2366,7 +2339,7 @@ load_type (const PSDlayerres  *res_a,
       gchar  *str;
       gint32  bread, bwritten;
 
-      str = fread_unicode_string (&bread, &bwritten, 1, res_a->ibm_pc_format,
+      str = fread_unicode_string (&bread, &bwritten, 1, ibm_pc_format,
                                   input, error);
       if (! str)
         {
@@ -2375,14 +2348,19 @@ load_type (const PSDlayerres  *res_a,
         }
       IFDBG(3) g_debug ("string value: %s (class id: '%s', key: '%s')", str, class_id, key);
       *node = add_descriptor_text (key, type, class_id, str);
+
+/* - disabled so that we can make parsing independent of specific Photoshop
+     plug-in code. Interpreting should eventually be done in the calling
+     function based on the resulting json data.
+
       if (strcmp (class_id, "TxLr") == 0 &&
           strcmp (key, "Txt ") == 0)
         {
-          /* Text of a text layer */
+          // Text of a text layer
           lyr_a->text.info = strdup (str);
           g_printerr ("Saved text to layer record: '%s'\n", lyr_a->text.info);
         }
-
+*/
       g_free (str);
     }
   else if (memcmp (type, "enum", 4) == 0)
@@ -2413,6 +2391,7 @@ load_type (const PSDlayerres  *res_a,
         }
       psdlong = GUINT32_FROM_BE (psdlong);
       IFDBG(3) g_debug ("long value: %d", psdlong);
+      *node = add_descriptor_long (key, type, psdlong);
     }
   else if (memcmp (type, "comp", 4) == 0)
     {
@@ -2426,6 +2405,7 @@ load_type (const PSDlayerres  *res_a,
         }
       psdlarge = GUINT32_FROM_BE (psdlarge);
       IFDBG(3) g_debug ("large value: %" G_GINT64_FORMAT, psdlarge);
+      *node = add_descriptor_comp (key, type, psdlarge);
     }
   else if (memcmp (type, "bool", 4) == 0)
     {
@@ -2439,33 +2419,30 @@ load_type (const PSDlayerres  *res_a,
         }
       IFDBG(3) g_debug ("Boolean value: %u", (gboolean) val);
       *node = add_descriptor_bool (key, type, val);
-
-      //node = json_node_new (JSON_NODE_VALUE);
-      //json_node_set_boolean (node, val);
     }
   else if (memcmp (type, "GlbO", 4) == 0)
     {
       /* GlobalObject same as Descriptor */
       IFDBG(3) g_debug ("GlbO GlobalObject same as Descriptor");
-      g_message ("FIXME Type: %s", type);
+      g_message ("FIXME Type: %.4s", type);
     }
   else if (memcmp (type, "type", 4) == 0)
     {
       /* Class */
       IFDBG(3) g_debug ("type (Class)");
-      g_message ("FIXME Type: %s", type);
+      g_message ("FIXME Type: %.4s", type);
     }
   else if (memcmp (type, "GlbC", 4) == 0)
     {
       /* Class */
       IFDBG(3) g_debug ("GlbC (global? Class)");
-      g_message ("FIXME Type: %s", type);
+      g_message ("FIXME Type: %.4s", type);
     }
   else if (memcmp (type, "alis", 4) == 0)
     {
       /* Alias */
       IFDBG(3) g_debug ("alis (Alias)");
-      g_message ("FIXME Type: %s", type);
+      g_message ("FIXME Type: %.4s", type);
     }
   else if (memcmp (type, "tdta", 4) == 0)
     {
@@ -2473,6 +2450,8 @@ load_type (const PSDlayerres  *res_a,
       guint32  size = 0;
       goffset  ofs;
       gchar   *buf = NULL;
+
+      g_message ("FIXME Type: %.4s - missing json conversion", type);
 
       if (psd_read (input, &size, 4, error) < 4)
         {
@@ -2490,7 +2469,7 @@ load_type (const PSDlayerres  *res_a,
           psd_set_error (error);
           return -1;
         }
-      parse_text_info (lyr_a, size, buf, error);
+      parse_text_info (size, buf, error);
       g_free (buf);
       if (! psd_seek (input, ofs, G_SEEK_SET, error))
         {
@@ -2504,6 +2483,8 @@ load_type (const PSDlayerres  *res_a,
       gint32  res;
       guint32 count = 0;
 
+      g_message ("FIXME Type: %.4s - missing json conversion", type);
+
       if (psd_read (input, &count, 4, error) < 4)
         {
           psd_set_error (error);
@@ -2514,7 +2495,7 @@ load_type (const PSDlayerres  *res_a,
       IFDBG(3) g_debug ("Descriptor version: %u", count);
 
       IFDBG(3) g_debug ("Descriptor array begin");
-      res = load_descriptor (res_a, lyr_a, NULL, input, error);
+      res = load_descriptor (input, ibm_pc_format, NULL, error);
       IFDBG(3) g_debug ("Descriptor array end");
       if (res < 0)
         return res;
@@ -2523,16 +2504,16 @@ load_type (const PSDlayerres  *res_a,
     {
       /* Undocumented: Path */
       IFDBG(3) g_debug ("Pth (Path, undocumented)");
-      g_message ("FIXME Type: %s", type);
+      g_message ("FIXME Type: %.4s", type);
     }
   else
     {
-      // unknown...
+      /* Unknown/undocumented Photoshop descriptor type */
       IFDBG(3) g_debug ("Unknown or undocumented type %s", type);
       g_warning ("Unknown or undocumented type %s", type);
-      g_message ("FIXME Type: %s", type);
+      g_message ("FIXME Type: %.4s", type);
       return -2;
     }
-  g_printerr ("- return ok from load_type\n");
+
   return 0;
 }
