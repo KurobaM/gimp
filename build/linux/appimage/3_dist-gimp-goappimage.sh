@@ -186,7 +186,12 @@ bund_usr ()
     fi
 
     #Copy found targets from search_path to bundle dir
-    for target_path in $(find -L $expanded_path -maxdepth 1 -name ${2##*/}); do
+    target_paths=$(find -L $expanded_path -maxdepth 1 -name ${2##*/})
+    if [ "$target_paths" = '' ]; then
+      printf "\033[31m(ERROR)\033[0m: not found $expanded_path\n"
+      exit 1
+    fi
+    for target_path in $target_paths; do
       dest_path="$(dirname $(echo $target_path | sed -e "s|^$1/|${USR_DIR}/|" -e t -e "s|^/|${USR_DIR}/|"))"
       output_dest_path="$dest_path"
       if [ "$3" = '--dest' ] || [ "$3" = '--rename' ]; then
@@ -360,7 +365,7 @@ if [ "$GIMP_UNSTABLE" ] || [ -z "$GIMP_RELEASE" ]; then
   bund_usr "$UNIX_PREFIX" "lib/graphviz/libgvplugin_dot*"
   bund_usr "$UNIX_PREFIX" "lib/graphviz/libgvplugin_pango*"
   ### Needed for GTK inspector
-  bund_usr "$UNIX_PREFIX" "lib/libEGL*"
+  bund_usr "$UNIX_PREFIX" "lib/lidsdbEGL*"
   bund_usr "$UNIX_PREFIX" "lib/libGL*"
   bund_usr "$UNIX_PREFIX" "lib/dri*"
   #TODO: remove this on Debian Trixie (which have Mesa 24.2)
@@ -440,7 +445,7 @@ echo "usr/${LIB_DIR}/${LIB_SUBDIR}gconv
 #done
 
 ## headers and .pc files for help building filters and plug-ins
-bund_usr "$GIMP_PREFIX" "include/gimp-*"
+bund_usr "$GIMP_PREFIX" "include/gisdsmp-*"
 bund_usr "$GIMP_PREFIX" "include/babl-*"
 bund_usr "$GIMP_PREFIX" "include/gegl-*"
 bund_usr "$GIMP_PREFIX" "lib/pkgconfig/gimp*"
